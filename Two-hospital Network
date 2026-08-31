@@ -1,0 +1,1319 @@
+from __future__ import annotations
+
+"""
+Dual column-generation ADP for the two-hospital platelet inventory model.
+
+Target computational environment for the reported runs:
+Python 3.8.15 on Linux 6.8.0-124-generic, x86-64 architecture,
+13.61 GB RAM, Gurobi Optimizer 13.0.2 through the gurobipy package.
+
+This version uses Gurobi for the restricted master problem and performs exact
+pricing over a user-supplied finite set of pricing states. 
+"""
+
+from dataclasses import dataclass, field
+from itertools import product
+from math import ceil, exp
+import importlib
+from pathlib import Path
+import sys
+import time
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+except ImportError:
+    gp = None
+    GRB = None
+
+
+MAJOR = 1
+LOCAL = 2
+HOSPITALS = (MAJOR, LOCAL)
+O_POS = "O+"
+O_NEG = "O-"
+BLOOD_TYPES = (O_POS, O_NEG)
+DEMAND_KEYS = tuple((i, r) for i in HOSPITALS for r in BLOOD_TYPES)
+
+InvKey = Tuple[int, str, int]
+DemandKey = Tuple[int, str]
+Inventory = Dict[InvKey, int]
+Demand = Dict[DemandKey, int]
+TransshipmentToday = Dict[str, int]
+PricingState = Tuple[int, Inventory, Demand, TransshipmentToday]
+
+
+def _demand_cost(default: float) -> Dict[DemandKey, float]:
+    return {key: default for key in DEMAND_KEYS}
+
+
+def _trans_cost(default: float) -> Dict[Tuple[int, int, str], float]:
+    return {(LOCAL, MAJOR, r): default for r in BLOOD_TYPES}
+
+
+def _sub_cost(default: float) -> Dict[Tuple[int, str, str], float]:
+    return {(i, O_POS, O_NEG): default for i in HOSPITALS}
+
+
+def _order_up_to_default() -> Dict[DemandKey, int]:
+    return {
+        (MAJOR, O_POS): 28,
+        (MAJOR, O_NEG): 10,
+        (LOCAL, O_POS): 10,
+        (LOCAL, O_NEG): 4,
+    }
+
+
+@dataclass
+class ADPConfig:
+    M: int = 5
+    gamma: float = 0.98
+    major_order_days: Tuple[int, ...] = (0, 2, 4)
+    local_order_days: Tuple[int, ...] = (0, 3)
+    max_regular_order: int = 40
+    max_inventory_per_age: int = 50
+    initial_inventory_override: Dict[InvKey, int] = field(default_factory=dict)
+    initial_transshipped: Dict[str, int] = field(default_factory=lambda: {O_NEG: 20, O_POS: 10})
+    max_actions_per_state: Optional[int] = None
+    next_demand_samples: int = 50
+    max_exact_demand_joint: int = 5000
+    artificial_penalty: float = 1_000_000.0
+    enforce_structural_zero_pruning: bool = True
+    future_cover_multiplier: float = 1.25
+    gurobi_output_flag: int = 0
+    gurobi_threads: Optional[int] = None
+    gurobi_method: Optional[int] = None
+    order_up_to: Dict[DemandKey, int] = field(default_factory=_order_up_to_default)
+    regular_cost: Dict[DemandKey, float] = field(default_factory=lambda: _demand_cost(15.0))
+    holding_cost: Dict[DemandKey, float] = field(default_factory=lambda: _demand_cost(1.0))
+    emergency_cost: Dict[DemandKey, float] = field(default_factory=lambda: _demand_cost(30.0))
+    wastage_cost: Dict[DemandKey, float] = field(default_factory=lambda: _demand_cost(3.0))
+    transshipment_cost: Dict[Tuple[int, int, str], float] = field(default_factory=lambda: _trans_cost(3.0))
+    substitution_cost: Dict[Tuple[int, str, str], float] = field(default_factory=lambda: _sub_cost(2.0))
+
+    def __post_init__(self) -> None:
+        if self.M < 3:
+            raise ValueError("M must be at least 3.")
+        if not (0.0 < self.gamma < 1.0):
+            raise ValueError("Use 0 < gamma < 1.")
+
+    def is_order_day(self, hospital: int, k: int) -> bool:
+        if hospital == MAJOR:
+            return k in self.major_order_days
+        if hospital == LOCAL:
+            return k in self.local_order_days
+        raise ValueError(f"Unknown hospital {hospital}.")
+
+
+@dataclass(frozen=True)
+class Action:
+    regular: Tuple[int, int, int, int]
+    substitute_opos_with_oneg: Tuple[int, int]
+
+
+@dataclass
+class StepResult:
+    immediate_cost: float
+    cost_components: Dict[str, float]
+    end_inventory: Inventory
+    next_inventory: Inventory
+    next_transshipped: Dict[str, int]
+    emergency: Dict[DemandKey, int]
+    substituted: Dict[Tuple[int, int], int]
+    issued_exact: Dict[InvKey, int]
+
+
+@dataclass
+class Column:
+    key: Tuple
+    k: int
+    inventory: Inventory
+    demand: Demand
+    transshipped_today: Dict[str, int]
+    action: Action
+    row: np.ndarray
+    cost: float
+
+
+@dataclass
+class DualRMPResult:
+    success: bool
+    objective: float
+    rho: np.ndarray
+    w: np.ndarray
+    artificial_l1: float
+    artificial_max: float
+    message: str
+
+
+class IndependentDemandModel:
+    def __init__(self, pmf: Mapping[int, Mapping[DemandKey, Sequence[Tuple[int, float]]]], seed: int = 1):
+        self.pmf = {
+            k: {key: self._normalize(dist) for key, dist in by_key.items()}
+            for k, by_key in pmf.items()
+        }
+        self.rng = np.random.default_rng(seed)
+
+    @staticmethod
+    def _normalize(dist: Sequence[Tuple[int, float]]) -> List[Tuple[int, float]]:
+        clean = [(int(v), float(p)) for v, p in dist if p > 0]
+        total = sum(p for _, p in clean)
+        if total <= 0:
+            raise ValueError("Demand PMF must have positive total probability.")
+        return [(v, p / total) for v, p in clean]
+
+    @classmethod
+    def from_weekday_poisson(
+        cls,
+        weekday_means: Mapping[int, Mapping[DemandKey, float]],
+        max_demand: int = 25,
+        seed: int = 1,
+    ) -> "IndependentDemandModel":
+        pmf: Dict[int, Dict[DemandKey, List[Tuple[int, float]]]] = {}
+        for k in range(7):
+            pmf[k] = {}
+            for key in DEMAND_KEYS:
+                pmf[k][key] = _truncated_poisson(float(weekday_means[k][key]), max_demand)
+        return cls(pmf, seed=seed)
+
+    def sample(self, k: int, rng: Optional[np.random.Generator] = None) -> Demand:
+        rng = rng or self.rng
+        out: Demand = {}
+        for key in DEMAND_KEYS:
+            values = np.array([v for v, _ in self.pmf[k][key]], dtype=int)
+            probs = np.array([p for _, p in self.pmf[k][key]], dtype=float)
+            out[key] = int(rng.choice(values, p=probs))
+        return out
+
+    def mean(self, k: int, key: DemandKey) -> float:
+        return float(sum(v * p for v, p in self.pmf[k][key]))
+
+    def joint_support_size(self, k: int) -> int:
+        size = 1
+        for key in DEMAND_KEYS:
+            size *= len(self.pmf[k][key])
+        return size
+
+    def joint_demands(self, k: int) -> Iterable[Tuple[Demand, float]]:
+        dists = [self.pmf[k][key] for key in DEMAND_KEYS]
+        for combo in product(*dists):
+            demand: Demand = {}
+            prob = 1.0
+            for key, (value, p) in zip(DEMAND_KEYS, combo):
+                demand[key] = int(value)
+                prob *= float(p)
+            yield demand, prob
+
+
+def _truncated_poisson(lam: float, max_demand: int) -> List[Tuple[int, float]]:
+    if lam < 0:
+        raise ValueError("Poisson mean must be nonnegative.")
+    probs = [0.0] * (max_demand + 1)
+    probs[0] = exp(-lam)
+    for x in range(1, max_demand + 1):
+        probs[x] = probs[x - 1] * lam / x
+    probs[-1] += max(0.0, 1.0 - sum(probs))
+    total = sum(probs)
+    return [(x, p / total) for x, p in enumerate(probs)]
+
+
+class EmpiricalWeekdayDemandModel:
+    """
+    Empirical demand model built from the real 2015-2016 training sequence.
+
+    For each weekday index, it samples from the historical demand vectors that
+    occurred at that position in the training sequence.
+    """
+
+    def __init__(
+        self,
+        daily_demands: Sequence[Mapping[DemandKey, int]],
+        start_weekday: int = 0,
+        seed: int = 1,
+    ):
+        if not daily_demands:
+            raise ValueError("daily_demands must not be empty.")
+        self.rng = np.random.default_rng(seed)
+        self.buckets: Dict[int, List[Demand]] = {k: [] for k in range(7)}
+        for t, demand in enumerate(daily_demands):
+            k = (start_weekday + t) % 7
+            self.buckets[k].append({key: int(demand.get(key, 0)) for key in DEMAND_KEYS})
+
+        for k, values in self.buckets.items():
+            if not values:
+                raise ValueError(f"No empirical demand observations for weekday index {k}.")
+
+        self.unique_by_weekday: Dict[int, List[Tuple[Demand, float]]] = {}
+        for k, values in self.buckets.items():
+            counts: Dict[Tuple[int, ...], int] = {}
+            for demand in values:
+                signature = tuple(int(demand[key]) for key in DEMAND_KEYS)
+                counts[signature] = counts.get(signature, 0) + 1
+            n = float(len(values))
+            self.unique_by_weekday[k] = [
+                ({key: int(value) for key, value in zip(DEMAND_KEYS, signature)}, count / n)
+                for signature, count in counts.items()
+            ]
+
+    def sample(self, k: int, rng: Optional[np.random.Generator] = None) -> Demand:
+        rng = rng or self.rng
+        values = self.buckets[k]
+        idx = int(rng.integers(0, len(values)))
+        return dict(values[idx])
+
+    def mean(self, k: int, key: DemandKey) -> float:
+        values = self.buckets[k]
+        return float(np.mean([demand[key] for demand in values]))
+
+    def joint_support_size(self, k: int) -> int:
+        return len(self.unique_by_weekday[k])
+
+    def joint_demands(self, k: int) -> Iterable[Tuple[Demand, float]]:
+        yield from self.unique_by_weekday[k]
+
+
+def _rl_array_to_demand(arr: np.ndarray, base_module) -> Demand:
+    values = np.asarray(arr, dtype=int)
+    return {
+        (MAJOR, O_POS): int(values[base_module.H_MAJOR, base_module.T_POS]),
+        (MAJOR, O_NEG): int(values[base_module.H_MAJOR, base_module.T_NEG]),
+        (LOCAL, O_POS): int(values[base_module.H_LOCAL, base_module.T_POS]),
+        (LOCAL, O_NEG): int(values[base_module.H_LOCAL, base_module.T_NEG]),
+    }
+
+
+def load_real_demands_from_exact_pdf_adp(
+    workdir: Optional[Union[str, Path]] = None,
+    demand_filename: str = "real_demand_2015_2017.xlsx",
+) -> Tuple[List[Demand], List[Demand], int]:
+    """
+    Load the exact same demand source as the RL code:
+        training = 2015 + 2016
+        testing = 2017
+
+    The day index starts at 0 to match the RL environment reset, where day 0 is
+    Monday for the ordering schedule.
+    """
+    root = Path.cwd() if workdir is None else Path(workdir)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    try:
+        base = importlib.import_module("exact_pdf_adp")
+    except ModuleNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Could not import exact_pdf_adp.py from {root}. Run this script from the "
+            "same folder as your RL/ADP files."
+        ) from exc
+
+    demand_path = root / demand_filename
+    if not demand_path.exists():
+        raise FileNotFoundError(
+            f"Could not find {demand_path}. This file is required for real 2015-2017 demand."
+        )
+
+    base.COSTS["regular_order"] = 15.0
+    base.COSTS["holding"] = 1.0
+    base.COSTS["transshipment"] = 3.0
+    base.COSTS["substitution"] = 2.0
+    base.COSTS["expiration"] = 3.0
+    base.COSTS["emergency"] = 30.0
+
+    source_cfg = base.CFG
+    source_cfg.demand_file = demand_path
+    source_cfg.max_regular_order = 40
+    source_cfg.max_inventory_per_age = 50
+    source_cfg.allow_substitution = True
+    source_cfg.ordering_weeks = 52
+
+    demand_model = base.DemandModel(source_cfg)
+    training_demands = [_rl_array_to_demand(d, base) for d in demand_model.training]
+    testing_demands = [_rl_array_to_demand(d, base) for d in demand_model.testing]
+
+    if not training_demands:
+        raise ValueError("DemandModel returned no training demands for 2015-2016.")
+    if not testing_demands:
+        raise ValueError("DemandModel returned no testing demands for 2017.")
+
+    return training_demands, testing_demands, 0
+
+
+def _rl_inventory_array_to_internal(arr: np.ndarray, base_module, cfg: ADPConfig) -> Inventory:
+    values = np.asarray(arr, dtype=int)
+    inv = zero_inventory(cfg)
+    hospital_map = ((MAJOR, base_module.H_MAJOR), (LOCAL, base_module.H_LOCAL))
+    type_map = ((O_POS, base_module.T_POS), (O_NEG, base_module.T_NEG))
+    for internal_h, rl_h in hospital_map:
+        for internal_r, rl_bt in type_map:
+            for m in range(1, cfg.M + 1):
+                inv[(internal_h, internal_r, m)] = int(values[rl_h, rl_bt, m - 1])
+    return clean_inventory(inv, cfg, state_only=False)
+
+
+def configure_initial_inventory_from_exact_pdf_adp(
+    cfg: ADPConfig,
+    workdir: Optional[Union[str, Path]] = None,
+    demand_filename: str = "real_demand_2015_2017.xlsx",
+) -> Inventory:
+    """
+    Use the same initial inventory as RL:
+        base.default_initial_inventory(cfg)
+    """
+    root = Path.cwd() if workdir is None else Path(workdir)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    base = importlib.import_module("exact_pdf_adp")
+    demand_path = root / demand_filename
+    source_cfg = base.CFG
+    source_cfg.demand_file = demand_path
+    source_cfg.max_regular_order = cfg.max_regular_order
+    source_cfg.max_inventory_per_age = cfg.max_inventory_per_age
+    source_cfg.allow_substitution = True
+    source_cfg.ordering_weeks = 52
+
+    initial_before = base.default_initial_inventory(source_cfg)
+    moved_by_blood_type = np.asarray(initial_before[base.H_LOCAL, :, 0], dtype=int).copy()
+    initial_after, _ = base.apply_transshipment(initial_before)
+
+    cfg.initial_transshipped = {
+        O_POS: int(moved_by_blood_type[base.T_POS]),
+        O_NEG: int(moved_by_blood_type[base.T_NEG]),
+    }
+    cfg.initial_inventory_override = _rl_inventory_array_to_internal(initial_after, base, cfg)
+    return dict(cfg.initial_inventory_override)
+
+
+def state_ages(hospital: int, cfg: ADPConfig) -> range:
+    return range(1, cfg.M) if hospital == MAJOR else range(2, cfg.M)
+
+
+def action_ages(hospital: int, cfg: ADPConfig) -> range:
+    return range(1, cfg.M + 1) if hospital == MAJOR else range(2, cfg.M + 1)
+
+
+def zero_inventory(cfg: ADPConfig) -> Inventory:
+    return {
+        (i, r, m): 0
+        for i in HOSPITALS
+        for r in BLOOD_TYPES
+        for m in range(1, cfg.M + 1)
+    }
+
+
+def clean_inventory(inventory: Mapping[InvKey, int], cfg: ADPConfig, state_only: bool = False) -> Inventory:
+    out = zero_inventory(cfg)
+    for key, qty in inventory.items():
+        i, r, m = key
+        if i in HOSPITALS and r in BLOOD_TYPES and 1 <= m <= cfg.M:
+            out[key] = max(0, int(qty))
+    for r in BLOOD_TYPES:
+        out[(LOCAL, r, 1)] = 0
+        if state_only:
+            out[(MAJOR, r, cfg.M)] = 0
+            out[(LOCAL, r, cfg.M)] = 0
+    return out
+
+
+def base_feature_keys(cfg: ADPConfig) -> List[InvKey]:
+    return [(i, r, m) for i in HOSPITALS for r in BLOOD_TYPES for m in state_ages(i, cfg)]
+
+
+def enumerate_inventory_states_from_grid(
+    cfg: ADPConfig,
+    inventory_values_by_key: Mapping[InvKey, Sequence[int]],
+) -> Iterator[Inventory]:
+    
+    keys = base_feature_keys(cfg)
+    grids: List[Sequence[int]] = []
+    for key in keys:
+        values = inventory_values_by_key.get(key, [0])
+        grids.append(tuple(sorted({max(0, int(value)) for value in values})))
+
+    for combo in product(*grids):
+        inv = zero_inventory(cfg)
+        for key, value in zip(keys, combo):
+            inv[key] = int(value)
+        yield clean_inventory(inv, cfg, state_only=True)
+
+
+def build_finite_pricing_states(
+    cfg: ADPConfig,
+    demand_model,
+    inventory_values_by_key: Mapping[InvKey, Sequence[int]],
+    transshipped_values_by_type: Mapping[str, Sequence[int]],
+) -> List[PricingState]:
+    
+    z_grids = {
+        r: tuple(sorted({max(0, int(value)) for value in transshipped_values_by_type.get(r, [0])}))
+        for r in BLOOD_TYPES
+    }
+    states: List[PricingState] = []
+    seen = set()
+
+    for k in range(7):
+        demands = list(demand_model.joint_demands(k))
+        inventories = list(enumerate_inventory_states_from_grid(cfg, inventory_values_by_key))
+        for inventory in inventories:
+            inv_tuple = tuple((key, inventory[key]) for key in sorted(inventory))
+            for demand, _prob in demands:
+                dem_tuple = tuple((key, int(demand.get(key, 0))) for key in DEMAND_KEYS)
+                for z_opos, z_oneg in product(z_grids[O_POS], z_grids[O_NEG]):
+                    z_today = {O_POS: int(z_opos), O_NEG: int(z_oneg)}
+                    z_tuple = tuple((r, z_today[r]) for r in BLOOD_TYPES)
+                    key = (k, inv_tuple, dem_tuple, z_tuple)
+                    if key not in seen:
+                        seen.add(key)
+                        states.append((k, dict(inventory), dict(demand), z_today))
+
+    return states
+
+
+def structurally_supported_feature(k: int, key: InvKey, cfg: ADPConfig) -> bool:
+    if not cfg.enforce_structural_zero_pruning:
+        return True
+
+    hospital, _, age = key
+    if hospital == LOCAL:
+        if age < 2 or age >= cfg.M:
+            return False
+        return any(k == (od + cfg.M - age) % 7 for od in cfg.local_order_days)
+
+    if hospital == MAJOR:
+        if age < 1 or age >= cfg.M:
+            return False
+        own_inventory = any(k == (od + cfg.M - age) % 7 for od in cfg.major_order_days)
+        local_transshipment = age == 1 and any(
+            k == (od + cfg.M - 1) % 7 for od in cfg.local_order_days
+        )
+        return own_inventory or local_transshipment
+
+    return False
+
+
+class FeatureIndexer:
+    def __init__(self, cfg: ADPConfig):
+        self.cfg = cfg
+        self.base_keys = base_feature_keys(cfg)
+        self.intercept_index: Dict[int, int] = {}
+        self.inventory_index: Dict[Tuple[int, InvKey], int] = {}
+        self.names: List[Tuple] = []
+
+        for k in range(7):
+            self.intercept_index[k] = len(self.names)
+            self.names.append(("intercept", k))
+
+        for k in range(7):
+            for key in self.base_keys:
+                if structurally_supported_feature(k, key, cfg):
+                    self.inventory_index[(k, key)] = len(self.names)
+                    self.names.append(("inventory", k, key))
+
+    @property
+    def size(self) -> int:
+        return len(self.names)
+
+    def phi(self, k: int, inventory: Mapping[InvKey, int], demand: Mapping[DemandKey, int]) -> np.ndarray:
+        state_inv = clean_inventory(inventory, self.cfg, state_only=True)
+        post_direct, _, _ = fifo_issue_exact(state_inv, demand, self.cfg)
+        out = np.zeros(self.size, dtype=float)
+        out[self.intercept_index[k]] = 1.0
+        for key in self.base_keys:
+            idx = self.inventory_index.get((k, key))
+            if idx is not None:
+                out[idx] = float(post_direct[key])
+        return out
+
+    def weights_table(self, w: np.ndarray) -> np.ndarray:
+        table = np.zeros((7, 1 + len(self.base_keys)), dtype=float)
+        for k in range(7):
+            table[k, 0] = w[self.intercept_index[k]]
+            for j, key in enumerate(self.base_keys, start=1):
+                idx = self.inventory_index.get((k, key))
+                if idx is not None:
+                    table[k, j] = w[idx]
+        return table
+
+
+def fifo_issue_exact(
+    inventory: Mapping[InvKey, int],
+    demand: Mapping[DemandKey, int],
+    cfg: ADPConfig,
+) -> Tuple[Inventory, Dict[InvKey, int], Dict[DemandKey, int]]:
+    work = clean_inventory(inventory, cfg, state_only=False)
+    issued = {key: 0 for key in work}
+    residual: Dict[DemandKey, int] = {}
+    for i, r in DEMAND_KEYS:
+        need = max(0, int(demand.get((i, r), 0)))
+        for m in action_ages(i, cfg):
+            use = min(work[(i, r, m)], need)
+            work[(i, r, m)] -= use
+            issued[(i, r, m)] += use
+            need -= use
+            if need == 0:
+                break
+        residual[(i, r)] = need
+    return work, issued, residual
+
+
+def age_expire_and_transship(end_inventory: Mapping[InvKey, int], cfg: ADPConfig) -> Tuple[Inventory, Dict[str, int]]:
+    end_inv = clean_inventory(end_inventory, cfg, state_only=False)
+    next_inv = zero_inventory(cfg)
+    z_next = {r: 0 for r in BLOOD_TYPES}
+    for r in BLOOD_TYPES:
+        z_next[r] = end_inv[(LOCAL, r, 2)]
+        next_inv[(MAJOR, r, 1)] = end_inv[(MAJOR, r, 2)] + z_next[r]
+        next_inv[(LOCAL, r, 1)] = 0
+        for m in range(2, cfg.M):
+            next_inv[(MAJOR, r, m)] = end_inv[(MAJOR, r, m + 1)]
+            next_inv[(LOCAL, r, m)] = end_inv[(LOCAL, r, m + 1)]
+        next_inv[(MAJOR, r, cfg.M)] = 0
+        next_inv[(LOCAL, r, cfg.M)] = 0
+    return next_inv, z_next
+
+
+def add_regular_orders(inventory: Mapping[InvKey, int], k: int, action: Action, cfg: ADPConfig) -> Inventory:
+    work = clean_inventory(inventory, cfg, state_only=False)
+    checked_regular = checked_regular_quantities(work, k, action, cfg)
+    for idx, (i, r) in enumerate(DEMAND_KEYS):
+        qty = int(checked_regular[idx])
+        work[(i, r, cfg.M)] += qty
+    return work
+
+
+def checked_regular_quantities(
+    inventory: Mapping[InvKey, int],
+    k: int,
+    action: Action,
+    cfg: ADPConfig,
+) -> Tuple[int, int, int, int]:
+    
+    inv = clean_inventory(inventory, cfg, state_only=False)
+    checked: List[int] = []
+    for idx, (i, r) in enumerate(DEMAND_KEYS):
+        qty = max(0, int(action.regular[idx]))
+        if not cfg.is_order_day(i, k):
+            checked.append(0)
+            continue
+        fresh_space = max(0, cfg.max_inventory_per_age - int(inv[(i, r, cfg.M)]))
+        checked.append(int(min(qty, cfg.max_regular_order, fresh_space)))
+    return tuple(checked)  # type: ignore[return-value]
+
+
+def apply_action(
+    k: int,
+    inventory: Mapping[InvKey, int],
+    demand: Mapping[DemandKey, int],
+    action: Action,
+    cfg: ADPConfig,
+    transshipped_today: Optional[Mapping[str, int]] = None,
+) -> StepResult:
+    components = {
+        "regular_cost": 0.0,
+        "holding_cost": 0.0,
+        "emergency_cost": 0.0,
+        "wastage_cost": 0.0,
+        "transshipment_cost": 0.0,
+        "substitution_cost": 0.0,
+    }
+    transshipped_today = transshipped_today or {r: 0 for r in BLOOD_TYPES}
+
+    for r in BLOOD_TYPES:
+        components["transshipment_cost"] += (
+            cfg.transshipment_cost[(LOCAL, MAJOR, r)] * int(transshipped_today.get(r, 0))
+        )
+
+    checked_regular = checked_regular_quantities(inventory, k, action, cfg)
+    checked_action = Action(checked_regular, action.substitute_opos_with_oneg)
+
+    work = add_regular_orders(inventory, k, checked_action, cfg)
+    for idx, key in enumerate(DEMAND_KEYS):
+        components["regular_cost"] += cfg.regular_cost[key] * int(checked_action.regular[idx])
+
+    work, issued, residual = fifo_issue_exact(work, demand, cfg)
+
+    substituted: Dict[Tuple[int, int], int] = {}
+    for h_idx, i in enumerate(HOSPITALS):
+        requested = max(0, int(action.substitute_opos_with_oneg[h_idx]))
+        q_left = min(requested, residual[(i, O_POS)])
+        used_total = 0
+        for m in action_ages(i, cfg):
+            use = min(work[(i, O_NEG, m)], q_left)
+            if use > 0:
+                work[(i, O_NEG, m)] -= use
+                substituted[(i, m)] = substituted.get((i, m), 0) + use
+                used_total += use
+                q_left -= use
+            if q_left == 0:
+                break
+        residual[(i, O_POS)] -= used_total
+        components["substitution_cost"] += cfg.substitution_cost[(i, O_POS, O_NEG)] * used_total
+
+    emergency: Dict[DemandKey, int] = {}
+    for key in DEMAND_KEYS:
+        qty = max(0, int(residual[key]))
+        emergency[key] = qty
+        components["emergency_cost"] += cfg.emergency_cost[key] * qty
+
+    for i in HOSPITALS:
+        for r in BLOOD_TYPES:
+            for m in action_ages(i, cfg):
+                qty = work[(i, r, m)]
+                if m == 1:
+                    components["wastage_cost"] += cfg.wastage_cost[(i, r)] * qty
+                elif qty > 0:
+                    components["holding_cost"] += cfg.holding_cost[(i, r)] * qty
+
+    next_inventory, next_transshipped = age_expire_and_transship(work, cfg)
+    return StepResult(
+        immediate_cost=float(sum(components.values())),
+        cost_components=components,
+        end_inventory=work,
+        next_inventory=next_inventory,
+        next_transshipped=next_transshipped,
+        emergency=emergency,
+        substituted=substituted,
+        issued_exact=issued,
+    )
+
+
+class DualColumnGenerationADP:
+    def __init__(self, cfg: ADPConfig, demand_model: IndependentDemandModel, seed: int = 7):
+        if gp is None or GRB is None:
+            raise ImportError(
+                "This Gurobi column-generation version requires gurobipy. "
+                "Install Gurobi 13.0.2 and gurobipy in the Python 3.8.15 environment."
+            )
+        installed_version = ".".join(str(part) for part in gp.gurobi.version())
+        if installed_version != "13.0.2":
+            print(
+                f"Warning: target Gurobi version is 13.0.2, "
+                f"but gurobipy reports {installed_version}.",
+                file=sys.stderr,
+            )
+        self.cfg = cfg
+        self.demand_model = demand_model
+        self.rng = np.random.default_rng(seed)
+        self.features = FeatureIndexer(cfg)
+        self.weights = np.zeros(self.features.size, dtype=float)
+        self.columns: List[Column] = []
+        self.column_keys = set()
+
+    def expected_next_phi(self, next_k: int, next_inventory: Mapping[InvKey, int]) -> np.ndarray:
+        cfg = self.cfg
+        if self.demand_model.joint_support_size(next_k) <= cfg.max_exact_demand_joint:
+            acc = np.zeros(self.features.size, dtype=float)
+            for d_next, prob in self.demand_model.joint_demands(next_k):
+                acc += prob * self.features.phi(next_k, next_inventory, d_next)
+            return acc
+
+        acc = np.zeros(self.features.size, dtype=float)
+        for _ in range(cfg.next_demand_samples):
+            d_next = self.demand_model.sample(next_k, self.rng)
+            acc += self.features.phi(next_k, next_inventory, d_next)
+        return acc / float(cfg.next_demand_samples)
+
+    def expected_next_value(self, next_k: int, next_inventory: Mapping[InvKey, int]) -> float:
+        return float(self.weights @ self.expected_next_phi(next_k, next_inventory))
+
+    def days_until_next_order(self, hospital: int, k: int) -> int:
+        for delta in range(1, 8):
+            if self.cfg.is_order_day(hospital, (k + delta) % 7):
+                return delta
+        raise RuntimeError("No next order day found.")
+
+    def order_cycle_target(self, hospital: int, blood_type: str, k: int) -> int:
+        gap = self.days_until_next_order(hospital, k)
+        expected_future = sum(
+            self.demand_model.mean((k + delta) % 7, (hospital, blood_type))
+            for delta in range(1, gap + 1)
+        )
+        target = int(ceil(self.cfg.future_cover_multiplier * expected_future))
+        return max(self.cfg.order_up_to[(hospital, blood_type)], target)
+
+    def enumerate_actions(self, k: int, inventory: Mapping[InvKey, int], demand: Mapping[DemandKey, int]) -> List[Action]:
+        
+        cfg = self.cfg
+        inv = clean_inventory(inventory, cfg, state_only=False)
+        regular_grids: List[Iterable[int]] = []
+
+        for i, r in DEMAND_KEYS:
+            if not cfg.is_order_day(i, k):
+                regular_grids.append([0])
+                continue
+            fresh_space = max(0, cfg.max_inventory_per_age - int(inv[(i, r, cfg.M)]))
+            upper = min(cfg.max_regular_order, fresh_space)
+            regular_grids.append(range(upper + 1))
+
+        actions: List[Action] = []
+        for regular in product(*regular_grids):
+            base = Action(tuple(int(x) for x in regular), (0, 0))
+            work = add_regular_orders(inv, k, base, cfg)
+            after_exact, _, residual = fifo_issue_exact(work, demand, cfg)
+            sub_grids: List[List[int]] = []
+            for i in HOSPITALS:
+                available_oneg = sum(after_exact[(i, O_NEG, m)] for m in action_ages(i, cfg))
+                max_sub = min(residual[(i, O_POS)], available_oneg)
+                sub_grids.append(range(max_sub + 1))
+            for sub in product(*sub_grids):
+                actions.append(Action(tuple(int(x) for x in regular), tuple(int(x) for x in sub)))
+
+        return list(dict.fromkeys(actions))
+
+    def heuristic_action(self, k: int, inventory: Mapping[InvKey, int], demand: Mapping[DemandKey, int]) -> Action:
+        cfg = self.cfg
+        inv = clean_inventory(inventory, cfg, state_only=False)
+        regular: List[int] = []
+        for i, r in DEMAND_KEYS:
+            if cfg.is_order_day(i, k):
+                on_hand = sum(inv[(i, r, m)] for m in state_ages(i, cfg))
+                target = self.order_cycle_target(i, r, k)
+                qty = max(0, int(demand.get((i, r), 0)) + target - on_hand)
+                fresh_space = max(0, cfg.max_inventory_per_age - int(inv[(i, r, cfg.M)]))
+                regular.append(min(cfg.max_regular_order, fresh_space, qty))
+            else:
+                regular.append(0)
+
+        base = Action(tuple(regular), (0, 0))
+        work = add_regular_orders(inv, k, base, cfg)
+        after_exact, _, residual = fifo_issue_exact(work, demand, cfg)
+        sub: List[int] = []
+        for i in HOSPITALS:
+            available_oneg = sum(after_exact[(i, O_NEG, m)] for m in action_ages(i, cfg))
+            max_sub = min(residual[(i, O_POS)], available_oneg)
+            use_sub = cfg.substitution_cost[(i, O_POS, O_NEG)] < cfg.emergency_cost[(i, O_POS)]
+            sub.append(max_sub if use_sub else 0)
+        return Action(tuple(regular), tuple(sub))
+
+    def choose_action(
+        self,
+        k: int,
+        inventory: Mapping[InvKey, int],
+        demand: Mapping[DemandKey, int],
+        transshipped_today: Optional[Mapping[str, int]] = None,
+    ) -> Tuple[Action, StepResult, float]:
+        next_k = (k + 1) % 7
+        best_action: Optional[Action] = None
+        best_step: Optional[StepResult] = None
+        best_score = float("inf")
+        for action in self.enumerate_actions(k, inventory, demand):
+            step = apply_action(k, inventory, demand, action, self.cfg, transshipped_today)
+            score = step.immediate_cost + self.cfg.gamma * self.expected_next_value(next_k, step.next_inventory)
+            if score < best_score:
+                best_score = score
+                best_action = action
+                best_step = step
+        if best_action is None or best_step is None:
+            raise RuntimeError("No feasible action generated.")
+        return best_action, best_step, best_score
+
+    def sample_reachable_states(
+        self,
+        initial_inventory: Mapping[InvKey, int],
+        paths: int,
+        periods: int,
+        policy: str = "heuristic",
+    ) -> List[PricingState]:
+        states: List[Tuple[int, Inventory, Demand, Dict[str, int]]] = []
+        for _ in range(paths):
+            inventory = clean_inventory(initial_inventory, self.cfg, state_only=False)
+            z_today = initial_transshipped_from_rl_defaults(self.cfg)
+            for t in range(periods):
+                k = t % 7
+                demand = self.demand_model.sample(k, self.rng)
+                states.append((k, inventory.copy(), demand.copy(), z_today.copy()))
+                if policy == "adp":
+                    action, step, _ = self.choose_action(k, inventory, demand, z_today)
+                else:
+                    action = self.heuristic_action(k, inventory, demand)
+                    step = apply_action(k, inventory, demand, action, self.cfg, z_today)
+                inventory = step.next_inventory
+                z_today = step.next_transshipped
+        return states
+
+    def column_key(
+        self,
+        k: int,
+        inventory: Mapping[InvKey, int],
+        demand: Mapping[DemandKey, int],
+        z_today: Mapping[str, int],
+        action: Action,
+    ) -> Tuple:
+        inv_tuple = tuple((key, int(inventory.get(key, 0))) for key in sorted(zero_inventory(self.cfg)))
+        dem_tuple = tuple((key, int(demand.get(key, 0))) for key in DEMAND_KEYS)
+        z_tuple = tuple((r, int(z_today.get(r, 0))) for r in BLOOD_TYPES)
+        return (k, inv_tuple, dem_tuple, z_tuple, action.regular, action.substitute_opos_with_oneg)
+
+    def make_column(
+        self,
+        k: int,
+        inventory: Mapping[InvKey, int],
+        demand: Mapping[DemandKey, int],
+        z_today: Mapping[str, int],
+        action: Action,
+    ) -> Column:
+        step = apply_action(k, inventory, demand, action, self.cfg, z_today)
+        next_k = (k + 1) % 7
+        phi_now = self.features.phi(k, inventory, demand)
+        phi_next = self.expected_next_phi(next_k, step.next_inventory)
+        row = phi_now - self.cfg.gamma * phi_next
+        key = self.column_key(k, inventory, demand, z_today, action)
+        return Column(
+            key=key,
+            k=k,
+            inventory=dict(inventory),
+            demand=dict(demand),
+            transshipped_today=dict(z_today),
+            action=action,
+            row=row,
+            cost=step.immediate_cost,
+        )
+
+    def add_column(self, column: Column) -> bool:
+        if column.key in self.column_keys:
+            return False
+        self.columns.append(column)
+        self.column_keys.add(column.key)
+        return True
+
+    def relevance_alpha(self, relevance_states: Sequence[PricingState]) -> np.ndarray:
+        alpha = np.zeros(self.features.size, dtype=float)
+        for k, inventory, demand, _ in relevance_states:
+            alpha += self.features.phi(k, inventory, demand)
+        return alpha / max(1, len(relevance_states))
+
+    def solve_dual_rmp(
+        self,
+        relevance_states: Sequence[PricingState],
+    ) -> DualRMPResult:
+        if not self.columns:
+            raise ValueError("Dual RMP has no state-action columns.")
+
+        alpha = self.relevance_alpha(relevance_states)
+        a_cols = np.column_stack([col.row for col in self.columns])
+        costs = np.array([col.cost for col in self.columns], dtype=float)
+
+        p = self.features.size
+        n_cols = len(self.columns)
+
+        model = gp.Model("dual_restricted_master_problem")
+        model.Params.OutputFlag = int(self.cfg.gurobi_output_flag)
+        if self.cfg.gurobi_threads is not None:
+            model.Params.Threads = int(self.cfg.gurobi_threads)
+        if self.cfg.gurobi_method is not None:
+            model.Params.Method = int(self.cfg.gurobi_method)
+
+        rho_vars = model.addVars(n_cols, lb=0.0, name="rho")
+        art_pos = model.addVars(p, lb=0.0, name="art_pos")
+        art_neg = model.addVars(p, lb=0.0, name="art_neg")
+
+        model.setObjective(
+            gp.quicksum(float(costs[j]) * rho_vars[j] for j in range(n_cols))
+            + self.cfg.artificial_penalty
+            * gp.quicksum(art_pos[row] + art_neg[row] for row in range(p)),
+            GRB.MINIMIZE,
+        )
+
+        balance_constraints = []
+        for row in range(p):
+            expr = gp.LinExpr()
+            for col_idx in range(n_cols):
+                coeff = float(a_cols[row, col_idx])
+                if abs(coeff) > 1e-12:
+                    expr.add(rho_vars[col_idx], coeff)
+            expr.add(art_pos[row], 1.0)
+            expr.add(art_neg[row], -1.0)
+            balance_constraints.append(
+                model.addConstr(expr == float(alpha[row]), name=f"balance_{row}")
+            )
+
+        model.optimize()
+        if model.Status != GRB.OPTIMAL:
+            raise RuntimeError(f"Dual RMP failed with Gurobi status {model.Status}.")
+
+        rho = np.array([rho_vars[j].X for j in range(n_cols)], dtype=float)
+        artificial = np.array(
+            [art_pos[row].X for row in range(p)] + [art_neg[row].X for row in range(p)],
+            dtype=float,
+        )
+        w = np.array([constr.Pi for constr in balance_constraints], dtype=float)
+        self.weights = w
+        return DualRMPResult(
+            success=True,
+            objective=float(model.ObjVal),
+            rho=rho,
+            w=w,
+            artificial_l1=float(np.sum(np.abs(artificial))),
+            artificial_max=float(np.max(np.abs(artificial))) if artificial.size else 0.0,
+            message="Gurobi optimal",
+        )
+
+    def initialize_columns(
+        self,
+        initial_inventory: Mapping[InvKey, int],
+        relevance_paths: int,
+        relevance_periods: int,
+    ) -> List[PricingState]:
+        relevance_states = self.sample_reachable_states(
+            initial_inventory,
+            paths=relevance_paths,
+            periods=relevance_periods,
+            policy="heuristic",
+        )
+        for k, inventory, demand, z_today in relevance_states:
+            for action in self.enumerate_actions(k, inventory, demand):
+                self.add_column(self.make_column(k, inventory, demand, z_today, action))
+        return relevance_states
+
+    def pricing(
+        self,
+        pricing_states: Sequence[PricingState],
+        violation_tol: float,
+        max_new_columns: Optional[int],
+    ) -> Tuple[float, int]:
+        candidates: List[Tuple[float, Column]] = []
+        max_violation = 0.0
+
+        for k, inventory, demand, z_today in pricing_states:
+            for action in self.enumerate_actions(k, inventory, demand):
+                column = self.make_column(k, inventory, demand, z_today, action)
+                if column.key in self.column_keys:
+                    continue
+                violation = float(column.row @ self.weights - column.cost)
+                max_violation = max(max_violation, violation)
+                if violation > violation_tol:
+                    candidates.append((violation, column))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        added = 0
+        limit = len(candidates) if max_new_columns is None else int(max_new_columns)
+        for _, column in candidates[:limit]:
+            if self.add_column(column):
+                added += 1
+
+        return max_violation, added
+
+    def train(
+        self,
+        initial_inventory: Mapping[InvKey, int],
+        pricing_states: Sequence[PricingState],
+        relevance_paths: int = 10,
+        relevance_periods: int = 56,
+        max_iterations: int = 200,
+        violation_tol: float = 1e-4,
+        max_new_columns: Optional[int] = 1000,
+        patience: int = 5,
+        min_iterations: int = 10,
+        verbose: bool = True,
+    ) -> DualRMPResult:
+        if not pricing_states:
+            raise ValueError(
+                "Exact column generation requires a non-empty finite pricing_states set. "
+                "Each pricing state must be (weekday, inventory, demand, transshipped_today)."
+            )
+        relevance_states = self.initialize_columns(initial_inventory, relevance_paths, relevance_periods)
+        clean_rounds = 0
+        result: Optional[DualRMPResult] = None
+
+        for iteration in range(max_iterations):
+            result = self.solve_dual_rmp(relevance_states)
+            max_violation, added = self.pricing(
+                pricing_states=pricing_states,
+                violation_tol=violation_tol,
+                max_new_columns=max_new_columns,
+            )
+            clean_rounds = clean_rounds + 1 if added == 0 else 0
+
+            if verbose:
+                print(
+                    f"iteration={iteration:02d} "
+                    f"dual_obj={result.objective:.6f} "
+                    f"columns={len(self.columns)} "
+                    f"max_violation={max_violation:.6g} "
+                    f"min_reduced_cost={-max_violation:.6g} "
+                    f"new_columns={added} "
+                    f"clean_rounds={clean_rounds} "
+                    f"artificial_l1={result.artificial_l1:.6g}"
+                )
+
+            if iteration + 1 >= min_iterations and clean_rounds >= patience:
+                break
+
+        if result is None:
+            raise RuntimeError("Training did not run.")
+        return result
+
+    def simulate_on_history(
+        self,
+        initial_inventory: Mapping[InvKey, int],
+        daily_demands: Sequence[Mapping[DemandKey, int]],
+        start_weekday: int = 0,
+    ) -> Dict[str, float]:
+        start = time.perf_counter()
+        inventory = clean_inventory(initial_inventory, self.cfg, state_only=False)
+        z_today = initial_transshipped_from_rl_defaults(self.cfg)
+
+        total_cost = 0.0
+        components = {
+            "regular_cost": 0.0,
+            "holding_cost": 0.0,
+            "emergency_cost": 0.0,
+            "wastage_cost": 0.0,
+            "transshipment_cost": 0.0,
+            "substitution_cost": 0.0,
+        }
+        regular_units = 0.0
+        emergency_units = 0.0
+        substitution_units = 0.0
+        wastage_units = 0.0
+        transshipped_units = 0.0
+        reg_by_key = {key: 0.0 for key in DEMAND_KEYS}
+        emg_by_key = {key: 0.0 for key in DEMAND_KEYS}
+
+        for t, demand in enumerate(daily_demands):
+            k = (start_weekday + t) % 7
+            action, step, _ = self.choose_action(k, inventory, demand, z_today)
+            total_cost += step.immediate_cost
+            for name, value in step.cost_components.items():
+                components[name] += value
+
+            regular_units += float(sum(action.regular))
+            emergency_units += float(sum(step.emergency.values()))
+            substitution_units += float(sum(step.substituted.values()))
+            wastage_units += float(sum(step.end_inventory[(i, r, 1)] for i in HOSPITALS for r in BLOOD_TYPES))
+            transshipped_units += float(sum(z_today.values()))
+            for idx, key in enumerate(DEMAND_KEYS):
+                reg_by_key[key] += float(action.regular[idx])
+                emg_by_key[key] += float(step.emergency[key])
+
+            inventory = step.next_inventory
+            z_today = step.next_transshipped
+
+        periods = len(daily_demands)
+        weeks = periods / 7.0
+        results = {
+            "testing_paths": 1.0,
+            "testing_periods": float(periods),
+            "testing_weeks": float(weeks),
+            "testing_runtime_seconds": float(time.perf_counter() - start),
+            "mean_undiscounted_cost": float(total_cost),
+            "std_undiscounted_cost": 0.0,
+            "mean_daily_cost": float(total_cost / periods),
+            "mean_weekly_cost": float(total_cost / weeks),
+            "mean_weekly_regular_cost": float(components["regular_cost"] / weeks),
+            "mean_weekly_holding_cost": float(components["holding_cost"] / weeks),
+            "mean_weekly_emergency_cost": float(components["emergency_cost"] / weeks),
+            "mean_weekly_substitution_cost": float(components["substitution_cost"] / weeks),
+            "mean_weekly_wastage_cost": float(components["wastage_cost"] / weeks),
+            "mean_weekly_transshipment_cost": float(components["transshipment_cost"] / weeks),
+            "mean_regular_units": float(regular_units),
+            "mean_emergency_units": float(emergency_units),
+            "mean_substitution_units": float(substitution_units),
+            "mean_wastage_units": float(wastage_units),
+            "mean_transshipped_units": float(transshipped_units),
+        }
+        for i, r in DEMAND_KEYS:
+            label = f"h{i}_{r.replace('+', 'pos').replace('-', 'neg')}"
+            results[f"mean_weekly_regular_units_{label}"] = float(reg_by_key[(i, r)] / weeks)
+            results[f"mean_weekly_emergency_units_{label}"] = float(emg_by_key[(i, r)] / weeks)
+        return results
+
+    def simulate(self, initial_inventory: Mapping[InvKey, int], paths: int = 100, periods: int = 365) -> Dict[str, float]:
+        start = time.perf_counter()
+        discounted_costs: List[float] = []
+        undiscounted_costs: List[float] = []
+        component_paths = {
+            "regular_cost": [],
+            "holding_cost": [],
+            "emergency_cost": [],
+            "wastage_cost": [],
+            "transshipment_cost": [],
+            "substitution_cost": [],
+        }
+        regular_units: List[float] = []
+        emergency_units: List[float] = []
+        substitution_units: List[float] = []
+        wastage_units: List[float] = []
+        transshipped_units: List[float] = []
+        reg_by_key = {key: [] for key in DEMAND_KEYS}
+        emg_by_key = {key: [] for key in DEMAND_KEYS}
+
+        for _ in range(paths):
+            inventory = clean_inventory(initial_inventory, self.cfg, state_only=False)
+            z_today = initial_transshipped_from_rl_defaults(self.cfg)
+            discounted = 0.0
+            undiscounted = 0.0
+            components = {name: 0.0 for name in component_paths}
+            reg_total = 0.0
+            emg_total = 0.0
+            sub_total = 0.0
+            waste_total = 0.0
+            trans_total = 0.0
+            reg_key_total = {key: 0.0 for key in DEMAND_KEYS}
+            emg_key_total = {key: 0.0 for key in DEMAND_KEYS}
+
+            for t in range(periods):
+                k = t % 7
+                demand = self.demand_model.sample(k, self.rng)
+                action, step, _ = self.choose_action(k, inventory, demand, z_today)
+                discounted += (self.cfg.gamma ** t) * step.immediate_cost
+                undiscounted += step.immediate_cost
+                for name, value in step.cost_components.items():
+                    components[name] += value
+                reg_total += float(sum(action.regular))
+                emg_total += float(sum(step.emergency.values()))
+                sub_total += float(sum(step.substituted.values()))
+                waste_total += float(sum(step.end_inventory[(i, r, 1)] for i in HOSPITALS for r in BLOOD_TYPES))
+                trans_total += float(sum(z_today.values()))
+                for idx, key in enumerate(DEMAND_KEYS):
+                    reg_key_total[key] += float(action.regular[idx])
+                    emg_key_total[key] += float(step.emergency[key])
+                inventory = step.next_inventory
+                z_today = step.next_transshipped
+
+            discounted_costs.append(discounted)
+            undiscounted_costs.append(undiscounted)
+            for name, value in components.items():
+                component_paths[name].append(value)
+            regular_units.append(reg_total)
+            emergency_units.append(emg_total)
+            substitution_units.append(sub_total)
+            wastage_units.append(waste_total)
+            transshipped_units.append(trans_total)
+            for key in DEMAND_KEYS:
+                reg_by_key[key].append(reg_key_total[key])
+                emg_by_key[key].append(emg_key_total[key])
+
+        weeks = periods / 7.0
+        mean_undiscounted = float(np.mean(undiscounted_costs))
+        results = {
+            "testing_paths": float(paths),
+            "testing_periods": float(periods),
+            "testing_weeks": float(weeks),
+            "testing_runtime_seconds": float(time.perf_counter() - start),
+            "mean_discounted_cost": float(np.mean(discounted_costs)),
+            "std_discounted_cost": float(np.std(discounted_costs, ddof=1)) if paths > 1 else 0.0,
+            "mean_undiscounted_cost": mean_undiscounted,
+            "std_undiscounted_cost": float(np.std(undiscounted_costs, ddof=1)) if paths > 1 else 0.0,
+            "standard_error_discounted_cost": float(np.std(discounted_costs, ddof=1) / np.sqrt(paths)) if paths > 1 else 0.0,
+            "mean_daily_cost": float(mean_undiscounted / periods),
+            "mean_weekly_cost": float(mean_undiscounted / weeks),
+            "mean_weekly_regular_cost": float(np.mean(component_paths["regular_cost"]) / weeks),
+            "mean_weekly_holding_cost": float(np.mean(component_paths["holding_cost"]) / weeks),
+            "mean_weekly_emergency_cost": float(np.mean(component_paths["emergency_cost"]) / weeks),
+            "mean_weekly_substitution_cost": float(np.mean(component_paths["substitution_cost"]) / weeks),
+            "mean_weekly_wastage_cost": float(np.mean(component_paths["wastage_cost"]) / weeks),
+            "mean_weekly_transshipment_cost": float(np.mean(component_paths["transshipment_cost"]) / weeks),
+            "mean_regular_units": float(np.mean(regular_units)),
+            "mean_emergency_units": float(np.mean(emergency_units)),
+            "mean_substitution_units": float(np.mean(substitution_units)),
+            "mean_wastage_units": float(np.mean(wastage_units)),
+            "mean_transshipped_units": float(np.mean(transshipped_units)),
+        }
+        for i, r in DEMAND_KEYS:
+            label = f"h{i}_{r.replace('+', 'pos').replace('-', 'neg')}"
+            results[f"mean_weekly_regular_units_{label}"] = float(np.mean(reg_by_key[(i, r)]) / weeks)
+            results[f"mean_weekly_emergency_units_{label}"] = float(np.mean(emg_by_key[(i, r)]) / weeks)
+        return results
+
+
+def initial_inventory_from_targets(cfg: ADPConfig) -> Inventory:
+
+    if cfg.initial_inventory_override:
+        return clean_inventory(cfg.initial_inventory_override, cfg, state_only=False)
+
+    inv = zero_inventory(cfg)
+
+    for m in range(1, cfg.M + 1):
+        inv[(MAJOR, O_NEG, m)] = 20
+        inv[(MAJOR, O_POS, m)] = 10
+        inv[(LOCAL, O_NEG, m)] = 20
+        inv[(LOCAL, O_POS, m)] = 10
+
+    inv[(MAJOR, O_NEG, 1)] += inv[(LOCAL, O_NEG, 1)]
+    inv[(MAJOR, O_POS, 1)] += inv[(LOCAL, O_POS, 1)]
+    inv[(LOCAL, O_NEG, 1)] = 0
+    inv[(LOCAL, O_POS, 1)] = 0
+    return inv
+
+
+def initial_transshipped_from_rl_defaults(cfg: ADPConfig) -> Dict[str, int]:
+    """First-day transshipment implied by the RL default initial inventory."""
+    return dict(cfg.initial_transshipped)
+
+
+def example_weekday_means() -> Dict[int, Dict[DemandKey, float]]:
+    raise RuntimeError(
+        "Synthetic example demand is disabled. Use load_real_demands_from_exact_pdf_adp() "
+        "so training uses 2015-2016 and testing uses 2017."
+    )
+
+
+if __name__ == "__main__":
+    cfg = ADPConfig(
+        M=5,
+        gamma=0.98,
+        max_regular_order=40,
+        max_inventory_per_age=50,
+        max_actions_per_state=None,
+        next_demand_samples=20,
+        max_exact_demand_joint=2000,
+        artificial_penalty=1_000_000.0,
+        enforce_structural_zero_pruning=True,
+        future_cover_multiplier=1.25,
+        gurobi_output_flag=0,
+        gurobi_threads=None,
+        gurobi_method=None,
+    )
+
+    training_demands, testing_demands, start_weekday = load_real_demands_from_exact_pdf_adp()
+    print(f"Training days from real data: {len(training_demands)}")
+    print(f"Testing days from real data: {len(testing_demands)}")
+
+    demand_model = EmpiricalWeekdayDemandModel(
+        training_demands,
+        start_weekday=start_weekday,
+        seed=10,
+    )
+    adp = DualColumnGenerationADP(cfg, demand_model, seed=11)
+    init_inv = configure_initial_inventory_from_exact_pdf_adp(cfg)
+
+    pricing_states: List[PricingState] = []
+
+    training_start = time.perf_counter()
+    rmp_result = adp.train(
+        init_inv,
+        pricing_states=pricing_states,
+        relevance_paths=10,
+        relevance_periods=56,
+        max_iterations=50,
+        violation_tol=1e-4,
+        max_new_columns=1000,
+        patience=5,
+        min_iterations=10,
+        verbose=True,
+    )
+    training_runtime = time.perf_counter() - training_start
+
+    print("\nDual RMP final result:")
+    print(f"dual_objective: {rmp_result.objective:.6f}")
+    print(f"columns: {len(adp.columns)}")
+    print(f"artificial_l1: {rmp_result.artificial_l1:.6g}")
+    print(f"artificial_max: {rmp_result.artificial_max:.6g}")
+
+    print("\nLearned weekday coefficients. Columns are: intercept, then base_feature_keys.")
+    print("base_feature_keys =", adp.features.base_keys)
+    print(np.round(adp.features.weights_table(adp.weights), 4))
+    print(f"\nTraining runtime seconds: {training_runtime:.3f}")
+
+    testing_results = adp.simulate_on_history(
+        init_inv,
+        testing_demands[: 52 * 7],
+        start_weekday=start_weekday,
+    )
+    print("\nTesting-stage final results:")
+    for key, value in testing_results.items():
+        print(f"{key}: {value:.6f}")
